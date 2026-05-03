@@ -201,26 +201,102 @@ def fetch_stock_info(symbol: str) -> dict | None:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_min_pb_covid(symbol: str) -> float | None:
-    """Get minimum P/B ratio during Feb–Oct 2020 (COVID crash period)."""
+    """
+    Compute minimum P/B during Feb–Oct 2020 using HISTORICAL book value.
+
+    Strategy:
+    1. Pull quarterly balance sheet → get Total Stockholder Equity + shares
+       outstanding for each quarter → book value per share per quarter.
+    2. For Q1 2020 (Mar) and Q2 2020 (Jun), interpolate daily BV/share by
+       forward-filling each quarter's value across its date range.
+    3. Pull daily closing prices Feb–Oct 2020.
+    4. Compute daily P/B = price / bv_per_share_that_day → take the minimum.
+    """
     try:
         ticker = yf.Ticker(get_ticker(symbol))
+
+        # ── Step 1: quarterly book value per share ───────────────────────────
+        bs = ticker.quarterly_balance_sheet
+        if bs is None or bs.empty:
+            return None
+
+        # Equity row — try multiple possible names
+        equity_row = None
+        for label in [
+            "Stockholders Equity",
+            "Total Stockholder Equity",
+            "Common Stock Equity",
+            "Total Equity Gross Minority Interest",
+        ]:
+            if label in bs.index:
+                equity_row = bs.loc[label]
+                break
+        if equity_row is None:
+            return None
+
+        # Shares — prefer ordinary shares outstanding from balance sheet,
+        # fall back to info (current value, less ideal but better than nothing)
+        shares_row = None
+        for label in ["Ordinary Shares Number", "Share Issued", "Common Stock"]:
+            if label in bs.index:
+                shares_row = bs.loc[label]
+                break
+
+        # Build a Series: date → bv_per_share
+        bv_series = {}
+        for col in equity_row.index:
+            equity = equity_row[col]
+            if pd.isna(equity):
+                continue
+            # Shares for this quarter
+            if shares_row is not None and col in shares_row.index and not pd.isna(shares_row[col]):
+                shares = shares_row[col]
+            else:
+                shares = ticker.info.get("sharesOutstanding")
+            if not shares or shares == 0:
+                continue
+            bv_series[pd.Timestamp(col)] = equity / shares
+
+        if not bv_series:
+            return None
+
+        bv_quarterly = pd.Series(bv_series).sort_index()
+
+        # ── Step 2: forward-fill BV/share to daily frequency ────────────────
+        # We need coverage from 2019-Q4 through 2020-Q3 at minimum
+        covid_start = pd.Timestamp("2020-02-01")
+        covid_end   = pd.Timestamp("2020-10-31")
+
+        daily_idx = pd.date_range(
+            start=min(bv_quarterly.index.min(), covid_start),
+            end=max(bv_quarterly.index.max(), covid_end),
+            freq="D",
+        )
+        bv_daily = bv_quarterly.reindex(daily_idx).ffill().bfill()
+
+        # Slice to COVID window
+        bv_covid = bv_daily.loc[covid_start:covid_end]
+        if bv_covid.empty or bv_covid.isna().all():
+            return None
+
+        # ── Step 3: daily closing prices ─────────────────────────────────────
         hist = ticker.history(start="2020-02-01", end="2020-10-31")
         if hist.empty:
             return None
-        info = ticker.info
-        book_value = info.get("bookValue")
-        shares = info.get("sharesOutstanding")
-        if not book_value or not shares:
-            # Use price-to-book from financials approximation
-            # Fallback: use current book value and historical prices
-            bv = info.get("bookValue")
-            if not bv:
-                return None
-            min_price = hist["Close"].min()
-            return round(min_price / bv, 2)
-        min_price = hist["Close"].min()
-        book_per_share = book_value  # yfinance gives book value per share
-        return round(min_price / book_per_share, 2)
+
+        hist.index = hist.index.tz_localize(None)          # strip tz
+        prices = hist["Close"]
+
+        # ── Step 4: daily P/B → minimum ──────────────────────────────────────
+        aligned_bv = bv_covid.reindex(prices.index).ffill().bfill()
+        daily_pb = prices / aligned_bv
+        daily_pb = daily_pb[daily_pb > 0]                  # drop nonsense
+
+        if daily_pb.empty:
+            return None
+
+        return round(float(daily_pb.min()), 2)
+
     except Exception:
         return None
 
@@ -274,9 +350,10 @@ def screen_stock(symbol: str, thresholds: dict) -> dict | None:
     roe = info["roe"]
     market_cap = info["market_cap_cr"]
 
-    # Criterion checks
-    c1 = (current_pb is not None and min_pb_covid is not None
-          and current_pb < min_pb_covid)
+    # Criterion 1: current P/B < 1.2 × historical COVID minimum P/B
+    pb_threshold = round(1.2 * min_pb_covid, 2) if min_pb_covid is not None else None
+    c1 = (current_pb is not None and pb_threshold is not None
+          and current_pb < pb_threshold)
     c2 = (roe is not None and roe > thresholds["min_roe"])
     c3 = (cfo_growth is not None and cfo_growth > thresholds["min_cfo_growth"])
     c4 = (market_cap is not None and market_cap > thresholds["min_market_cap"])
@@ -291,10 +368,11 @@ def screen_stock(symbol: str, thresholds: dict) -> dict | None:
         "Price (₹)": info["price"],
         "Market Cap (Cr)": market_cap,
         "Current P/B": round(current_pb, 2) if current_pb else None,
-        "Min P/B (Feb-Oct'20)": min_pb_covid,
+        "Min P/B Covid (Feb-Oct'20)": min_pb_covid,
+        "P/B Threshold (1.2×Covid)": pb_threshold,
         "ROE (%)": roe,
         "3Y Median CFO Growth (%)": cfo_growth,
-        "✅ P/B < COVID Low": c1,
+        "✅ P/B < 1.2× COVID Low": c1,
         "✅ ROE > Threshold": c2,
         "✅ CFO Growth > Threshold": c3,
         "✅ Market Cap > Threshold": c4,
@@ -431,8 +509,8 @@ if run_btn:
 
     display_cols = [
         "Symbol", "Name", "Sector", "Price (₹)", "Market Cap (Cr)",
-        "Current P/B", "Min P/B (Feb-Oct'20)", "ROE (%)",
-        "3Y Median CFO Growth (%)", "Criteria Passed", "PASSES ALL"
+        "Current P/B", "Min P/B Covid (Feb-Oct'20)", "P/B Threshold (1.2×Covid)",
+        "ROE (%)", "3Y Median CFO Growth (%)", "Criteria Passed", "PASSES ALL"
     ]
 
     with tab1:
@@ -465,8 +543,8 @@ if run_btn:
 
         with col_a:
             # Criteria pass rate bar chart
-            criteria_names = ["P/B < COVID Low", "ROE > Threshold", "CFO Growth > Threshold", "Market Cap > Threshold"]
-            criteria_cols = ["✅ P/B < COVID Low", "✅ ROE > Threshold", "✅ CFO Growth > Threshold", "✅ Market Cap > Threshold"]
+            criteria_names = ["P/B < 1.2× COVID Low", "ROE > Threshold", "CFO Growth > Threshold", "Market Cap > Threshold"]
+            criteria_cols = ["✅ P/B < 1.2× COVID Low", "✅ ROE > Threshold", "✅ CFO Growth > Threshold", "✅ Market Cap > Threshold"]
             pass_counts = [df[c].sum() for c in criteria_cols]
 
             fig = go.Figure(go.Bar(
